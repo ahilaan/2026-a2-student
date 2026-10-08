@@ -1,85 +1,51 @@
-# Assignment 2: Query Drift Arena
+# COL764 Assignment 2 — 2023CS10076
 
-Rerank a provided top-K candidate list with your own unigram language
-model, then build an RM1/RM2/RM3 relevance-feedback layer on top of it —
-and survive the harness quietly feeding that feedback function a
-noise-contaminated pseudo-relevant seed. See the assignment spec
-(`assignment2_query_drift_arena.docx`/`.pdf` in the course materials) for
-the full writeup; this README is quickstart + repo map only.
+The same query-likelihood candidate scorer is used in Tracks A, B and C.
+Queries and documents use stopword removal followed by the student's Porter
+stemmer. Ranking is restricted to the supplied candidate pool, with duplicate
+IDs removed and candidate order retained on exact ties.
 
-## Quickstart
+## Final model
+
+- Full-document unigram Dirichlet LM: `DIRICHLET_MU = 500`.
+- Word probabilities mix 0.75 full-document LM with 0.25 normalized LM of the
+  first 32 analyzed tokens, smoothed with `PREFIX_LM_MU = 100`.
+- Ordered adjacent-pair Dirichlet LM: weight 0.10, mu 500, with the normalized
+  product of collection unigram probabilities as its prior. Word and pair
+  log-likelihoods use the existing query-mass normalization.
+- Supplied feedback seeds drive RM1 and RM3: document mu 250, original-query
+  weight 0.88, 15 feedback terms and minimum support fraction 0.20. Coverage,
+  query anchoring, posterior weighting and confidence gating determine the
+  effective feedback mass. Original query pairs remain fixed.
+- Setting `RM3_LAMBDA_ORIG = 1.0` returns exactly the base scorer's document IDs
+  and floating-point scores. Pure unigram QL, RM2 and feedback diagnostics
+  remain independently callable for mathematical verification.
+
+Preparation and retrieval run in one process. Compact document statistics and
+bounded document-content caches avoid repeated analysis. No adversarial bonus
+is attempted; the starter bonus file contains a comment only.
+
+## Validation and packaging
 
 ```bash
 pip install -r requirements.txt
-pytest tests/ -v
-python -m harness.run_harness \
-  --corpus data/toy/corpus.jsonl \
-  --queries data/toy/queries_dev.tsv \
-  --qrels data/toy/qrels_dev.txt \
-  --candidates data/toy/candidates_dev.jsonl \
-  --run-out runs/dev_run.trec \
-  --report-out runs/dev_report.json
+python -m pytest tests -q
+python scripts/build_submission.py --entry 2023CS10076
 ```
 
-Or just run `bash scripts/smoke_test.sh`, which does all three.
+The builder writes `../2023CS10076.zip` and an identical
+`output/2023CS10076.zip`, preserving repository-root paths. Dataset files are
+excluded as required. The course's toy fixtures must be supplied locally for
+the toy conformance tests; they are retained in the working repository.
 
-## What you edit
+Original course documentation is preserved in `assignment2.pdf`,
+`assignment2.tex`, `docs/`, and [the starter README](docs/STARTER_README.md).
+The source-only file set is derived from starter Git commit
+`078249e765a38932f41914077814f20c2e11ddbf`, plus the active implementation,
+focused regression tests and submission builder.
 
-Only `submission/feedback.py` (and, optionally,
-`submission/adversarial_set.json` for the bonus track — see
-`docs/GRADING.md`). Everything under `harness/` is read-only reference
-code shared by every submission; it is what actually scores you, so
-reading it (especially `harness/leaderboard.py` and
-`harness/noise_injection.py`) is worth your time.
-
-## Repo map
-
-```
-submission/
-  feedback.py          <- YOUR CODE GOES HERE (the required entrypoint)
-  lm_utils.py           tokenizer + smoothing helpers (optional convenience)
-  corpus_utils.py        corpus loading helper (optional convenience)
-  adversarial_set.json  <- optional, bonus track (see docs/GRADING.md)
-
-harness/
-  run_harness.py         runs your submission end-to-end, prints a local sanity report
-  leaderboard.py          Track A/B/C + bonus percentile scoring (read this)
-  noise_injection.py       PUBLIC practice noise recipe (NOT the grading recipe)
-  candidates_io.py          reads the provided top-K candidate list
-  metrics.py               nDCG@10 / MAP@10 / MRR / P@k, TREC-eval-compatible
-  trec_io.py                corpus/queries/qrels/run file I/O
-
-docs/
-  SUBMISSION_INTERFACE.md   exact function signatures + conformance rules
-  GRADING.md                 what's public vs. undisclosed, wall-clock budget
-  RELEVANCE_FEEDBACK_PRIMER.md   compact RM1/RM2/RM3 formula reference
-
-data/toy/       20-doc hand-built set + provided candidates for fast local iteration (see data/README.md)
-scripts/        download_full_corpus.py, smoke_test.sh
-tests/          the exact tests CI runs on every push
-```
-
-## Differences from Assignment 1, at a glance
-
-- **You never build an index or rank the whole corpus.** Every retrieval
-  call is scoped to a PROVIDED candidate pool (`candidate_doc_ids`,
-  typically ~100 documents from an undisclosed reference retriever — see
-  `docs/GRADING.md`) — not `data/toy/corpus.jsonl` or `data/full/corpus.jsonl`
-  at large. `prepare()` still reads the whole corpus once for cheap,
-  one-time collection-wide statistics; nothing after that is O(corpus)
-  per query. This is deliberate: Assignment 1 already covered
-  "efficiently rank a whole corpus" — this assignment is about the
-  language model and the relevance-feedback layer, not indexing.
-- No Docker image, no build/load process split — `prepare()` and both
-  retrieval functions run in-process, called directly by
-  `run_harness.py`. See `docs/SUBMISSION_INTERFACE.md`.
-- Two required retrieval functions instead of one (`score_candidates()`
-  and `relevance_model_feedback()`), scored on three tracks instead of a
-  single accuracy metric plus efficiency/size modifiers — see the
-  assignment spec, Section 7.
-- A public, unit-tested "practice" noise-injection recipe you can sweep
-  locally (`harness/noise_injection.py`) — the real grading recipe is
-  undisclosed, same secrecy principle as Assignment 1's held-out topics.
-- An optional bonus track (`submission/adversarial_set.json`) that is
-  genuinely head-to-head against the rest of the class, not just a shared
-  leaderboard climb.
+AI-use disclosure: OpenAI Codex assisted with implementation, cleanup and
+validation. Provenance includes the supplied course starter/harness, the
+student's unigram/RM1/RM2/RM3 code and the student's Assignment 1 Porter
+implementation. The positional and ordered-pair LM arithmetic was implemented
+locally, without an external retrieval library.

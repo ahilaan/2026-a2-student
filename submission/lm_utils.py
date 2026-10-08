@@ -1,54 +1,41 @@
-"""
-submission/lm_utils.py
+"""One-pass unigram collection statistics with compact per-document counts.
 
-Small, shared, non-graded utilities for building unigram language-model
-statistics. You are welcome to use this as-is -- tokenising text and
-counting terms is plumbing, not the ranking/feedback logic the assignment
-grades -- or replace it with your own (e.g. if you want stemming or a
-different tokenisation scheme; nothing here is required).
-
-Design note (why per-document term counts are computed lazily): you are
-never asked to rank the whole corpus (see docs/SUBMISSION_INTERFACE.md --
-score_candidates()/relevance_model_feedback() only ever score the
-provided candidate pool, at most ~100 documents). Eagerly tokenising and
-counting terms for every document in a several-hundred-thousand-document
-corpus up front, when at most ~100 of them will ever actually be scored
-for a given query, would reintroduce exactly the kind of indexing-at-scale
-engineering Assignment 1 already covered and this assignment is
-deliberately not re-testing. CollectionStats below still reads the whole
-corpus once in prepare() -- collection-wide background statistics
-(P(w|C), Section 3.1) legitimately need that -- but per-document term
-counts are computed only for documents you actually ask about, the first
-time you ask, and cached from then on.
+Preparation analyzes each corpus record once to collect TF/DF, lengths and
+packed uint32 term counts. Analyzed token sequences are retained when the
+positional/pair scorer needs them. Candidate Counters are decoded lazily;
+only the supplied candidate documents are scored. Older trusted local
+statistics caches can still use the text-based fallback.
 """
 import re
+from array import array
 from collections import Counter
 from typing import Dict, List
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+ANALYZER = "stop_porter"
 
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-token tokeniser. Deliberately simple (no
-    stemming, no stopword removal) -- add either yourself if you want them;
-    just apply the same tokenize() consistently to documents and queries."""
-    return _TOKEN_RE.findall(text.lower())
+    """Apply the configured analyzer consistently to documents and queries.
+
+    Raw alphanumeric mode remains available for hand examples.
+    The shipped configuration removes stopwords and uses our own Porter port.
+    """
+    if ANALYZER == "raw":
+        return _TOKEN_RE.findall(text.lower())
+    from submission.analyzer import analyze
+    return analyze(text, ANALYZER)
+
+
+def candidate_rows(doc_ids, stats):
+    """Shared per-call content records; pool order and duplicate semantics stay."""
+    counts = stats.doc_term_counts
+    lengths = stats.doc_lengths
+    return [(doc, counts(doc), lengths[doc]) for doc in dict.fromkeys(doc_ids)]
 
 
 class CollectionStats:
-    """Collection-wide unigram statistics, plus on-demand per-document
-    term counts for whichever documents you actually look up (typically:
-    whatever candidate_doc_ids the harness gave you for the current
-    query -- see submission/feedback.py).
-
-    Built once in prepare() via from_corpus(). collection_term_counts /
-    collection_length are computed eagerly (one pass over the whole
-    corpus -- this is the legitimate, unavoidable cost of estimating a
-    background language model). Per-document term counts are computed
-    lazily via doc_term_counts(doc_id) and cached, so a corpus with
-    500,000 documents costs no more per-query than however many candidate
-    documents you're actually asked to score.
-    """
+    """Collection statistics and packed document counts, decoded on demand."""
 
     def __init__(self) -> None:
         self.doc_texts: Dict[str, str] = {}
@@ -57,6 +44,12 @@ class CollectionStats:
         self.collection_length: int = 0
         self.doc_ids: List[str] = []
         self._term_counts_cache: Dict[str, Counter] = {}
+        self.doc_freq: Counter = Counter()
+        self._packed_counts = {}
+        self._term_ids = {}
+        self._terms = []
+        self._collect_sequences = False
+        self._packed_sequences = {}
 
     def add_document(self, doc_id: str, text: str) -> None:
         """Called once per document during from_corpus() -- tokenises
@@ -67,6 +60,33 @@ class CollectionStats:
         candidate) are kept."""
         tokens = tokenize(text)
         counts = Counter(tokens)
+        # Preserve the previous last-text-per-ID DF semantics even if the
+        # corpus contains duplicate IDs; collection TF still counts records.
+        if doc_id in self.doc_texts:
+            previous = self.doc_term_counts(doc_id)
+            for term in previous:
+                self.doc_freq[term] -= 1
+                if self.doc_freq[term] == 0:
+                    del self.doc_freq[term]
+            self._term_counts_cache.pop(doc_id, None)
+        self.doc_freq.update(counts.keys())
+        packed = array('I')
+        ids, terms = self._term_ids, self._terms
+        for term, frequency in counts.items():
+            term_id = ids.get(term)
+            if term_id is None:
+                term_id = len(terms)
+                ids[term] = term_id
+                terms.append(term)
+            packed.append(term_id)
+            packed.append(frequency)
+        # Two uint32s per unique term, rather than a Python Counter per doc.
+        # Candidate Counters are decoded once on demand; raw text remains.
+        self._packed_counts[doc_id] = packed.tobytes()
+        if self._collect_sequences:
+            # Four bytes per token; reuse prepare's analysis, never stem again.
+            sequence = array('I', (ids[token] for token in tokens))
+            self._packed_sequences[doc_id] = sequence.tobytes()
         self.doc_texts[doc_id] = text
         self.doc_lengths[doc_id] = len(tokens)
         self.collection_term_counts.update(counts)
@@ -74,13 +94,21 @@ class CollectionStats:
         self.doc_ids.append(doc_id)
 
     def doc_term_counts(self, doc_id: str) -> Counter:
-        """Term counts for one document, computed on first request and
+        """Term counts for one document, decoded on first request and
         cached. Raises KeyError with a clear message for an unknown
         doc_id (e.g. a typo, or a doc_id from the wrong corpus)."""
         if doc_id not in self.doc_texts:
             raise KeyError(f"doc_id {doc_id!r} was not in the corpus passed to prepare()")
         if doc_id not in self._term_counts_cache:
-            self._term_counts_cache[doc_id] = Counter(tokenize(self.doc_texts[doc_id]))
+            packed_counts = getattr(self, '_packed_counts', None)
+            if packed_counts is not None and doc_id in packed_counts:
+                packed = memoryview(packed_counts[doc_id]).cast('I')
+                terms = self._terms
+                self._term_counts_cache[doc_id] = Counter({terms[packed[i]]: packed[i+1]
+                                                          for i in range(0, len(packed), 2)})
+            else:
+                # Backward compatibility for trusted older offline caches.
+                self._term_counts_cache[doc_id] = Counter(tokenize(self.doc_texts[doc_id]))
         return self._term_counts_cache[doc_id]
 
     def collection_prob(self, term: str) -> float:
@@ -94,8 +122,9 @@ class CollectionStats:
         return self.collection_term_counts.get(term, 0) / self.collection_length
 
     @classmethod
-    def from_corpus(cls, corpus: List[tuple]) -> "CollectionStats":
+    def from_corpus(cls, corpus: List[tuple], collect_sequences=False) -> "CollectionStats":
         stats = cls()
+        stats._collect_sequences = collect_sequences
         for doc_id, text in corpus:
             stats.add_document(doc_id, text)
         return stats
